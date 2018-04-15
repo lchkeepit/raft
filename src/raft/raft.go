@@ -137,6 +137,11 @@ func (rf *Raft) GetStateInfo() (int, string) {
 	return term, status
 }
 
+func (rf *Raft) PrintStateInfo(args *RequestAppendEntriesArgs, reply *RequestAppendEntriesReply)  {
+
+	Printf_2B("%d term %d log %+v\n", rf.me, rf.currentTerm, rf.log)
+}
+
 //
 // save Raft's persistent state to stable storage,
 // where it can later be retrieved after a crash and restart.
@@ -202,57 +207,75 @@ type RequestAppendEntriesArgs struct {
 
 type RequestAppendEntriesReply struct {
 	Term int
+	NextIndex int
 	Success bool
 }
 
 func (rf *Raft) RequestAppendEntries(args *RequestAppendEntriesArgs, reply *RequestAppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	if len(args.Entries) > 0 {
-		//Printf_2B("[RequestAppendEntries] %d term %d receive AppendEntries %+v from %d term %d\n", rf.me, rf.currentTerm, args, args.LeaderId, args.Term)
-	}
+
 	reply.Success = true
 
 	if (args.Term < rf.currentTerm) {
 		reply.Term = rf.currentTerm
 		reply.Success = false
-	} else if (args.Term > rf.currentTerm) {
+		reply.NextIndex = rf.getLastLog().Index + 1
+		return
+	}
+	rf.heartBeatChannel <- true
+	if (args.Term > rf.currentTerm) {
 		rf.currentTerm = args.Term
 		rf.becomeFollower()
 		rf.votedFor = -1
 	}
+	reply.Term = rf.currentTerm
 
-	if args.Term >= rf.currentTerm {
-		//mPrevIndex := rf.getLastLog().Index
-		//mPrevTerm := rf.getLastLog().Term
+	if !rf.logExist(args.PrevLogIndex){
+		Printf_2B("[RequestAppendEntries] %d reject args %+v\n", rf.me, args)
+		reply.Success = false
+		reply.NextIndex = rf.getLastLog().Index + 1
+		Printf_2B("[RequestAppendEntries] %d reject reply %+v\n", rf.me, reply)
+		return
+	}
 
-		if rf.currentTerm == args.PrevLogTerm && !rf.logExist(args.PrevLogIndex){
-			//Printf_2B("[RequestAppendEntries] %d reject args %+v\n", rf.me, args)
-			reply.Success = false
-			reply.Term = rf.currentTerm
-		} else if len(args.Entries) > 0 {
-			//Printf_2B("[RequestAppendEntries] %d \nlog %+v \n receive entry %+v prevIndex %d\n", rf.me, rf.log, args.Entries, args.PrevLogIndex)
-			index := args.PrevLogIndex - rf.log[0].Index + 1
-			rf.log = rf.log[:index]
-			if rf.logExist(index) && rf.log[index].Term != args.PrevLogTerm {
-				 //delete conflict logs
-			}
-			for i := range args.Entries {
-				rf.log = append(rf.log, args.Entries[i])
+	index := args.PrevLogIndex - rf.log[0].Index
+	//Printf_2B("[commit_follower] %d index %d\n", rf.me, index)
+	//rf.logExist(index)
+
+	if rf.log[index].Term != args.PrevLogTerm{
+		//conflict logs
+		tTerm := rf.log[index].Term
+		for i := index; i >= 0; i-- {
+			if rf.log[i].Term != tTerm {
+				reply.NextIndex = i + 1
+				break
 			}
 		}
+		// log conflict end and return without other operations
+		reply.Success = false
+		Printf_2B("[RequestAppendEntries] %d reject reply %+v\n", rf.me, reply)
+		return
+	} else {
+		rf.log = rf.log[:index + 1]
+		for i := range args.Entries {
+			rf.log = append(rf.log, args.Entries[i])
+		}
+		reply.NextIndex = rf.getLastLog().Index + 1
 	}
+
 	if reply.Success {
 		if args.LeaderCommit > rf.commitIndex {
 			rf.commitIndex = min(args.LeaderCommit, rf.getLastLog().Index)
 			rf.commitChannel <- true
-			Printf_2B("[commit_follower] %d commitIndex %d log %+v\n", rf.me, rf.commitIndex, rf.log)
+			Printf_2B("[commit_follower] %d term %d commitIndex %d log %+v\n", rf.me, rf.currentTerm, rf.commitIndex, rf.log)
+			Printf_2B("[commit_follower] args %+v\n", args)
 		}
 		rf.votedFor = -1
 		rf.becomeFollower()
-		rf.heartBeatChannel <- true
 	} else {
 		Printf_2B("[RequestAppendEntries] %d term %d reject args %+v\n", rf.me, rf.currentTerm, args)
+		Printf_2B("[RequestAppendEntries] %d log %+v\n", rf.me, rf.log)
 	}
 	//Printf_2B("[RequestAppendEntries] reply.Success %v %d (votefor %d) timeDurant %d electTimeout %d\n", reply.Success, rf.me, rf.votedFor, rf.timeDuration, rf.electTimeout)
 }
@@ -274,24 +297,31 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
 	} else if (args.Term > rf.currentTerm) {
+		rf.currentTerm = args.Term
 		rf.votedFor = -1
 		rf.becomeFollower()
-	} else if rf.votedFor != -1 && rf.votedFor != args.CandidateId{
+	}
+
+	if rf.votedFor != -1 && rf.votedFor != args.CandidateId{
 		CPrintf("%d (votefor %d) refuse voteRequest from %d\n", rf.me, rf.votedFor, args.CandidateId)
 		reply.VoteGranted = false
 	}
 
+	if args.LastLogTerm < rf.getLastLog().Term || args.LastLogTerm == rf.getLastLog().Term && args.LastLogIndex < rf.getLastLog().Index {
+		reply.VoteGranted = false
+	}
+
 	if reply.VoteGranted {
-		CPrintf("%d term %d (votefor %d) accept voteRequest from %d term %d \n",
-			rf.me, rf.currentTerm, rf.votedFor, args.CandidateId, args.Term)
+		Printf_2B("%d term %d log %+v accept voteRequest from %+v \n",
+			rf.me, rf.currentTerm, rf.log, args)
 		rf.votedFor = args.CandidateId
-		rf.currentTerm = args.Term
+		rf.becomeFollower()
+		//rf.currentTerm = args.Term
 
 		rf.grantVoteChannel <- true
 		CPrintf("%d become follower with electTimeout %d timeDuration %d", rf.me, rf.electTimeout, rf.timeDuration)
 	} else {
-		CPrintf("%d term %d (votefor %d) refuse voteRequest from %d term %d \n",
-			rf.me, rf.currentTerm, rf.votedFor, args.CandidateId, args.Term)
+		Printf_2B("%d term %d lastLog %+v  refuse voteRequest %+v \n", rf.me, rf.currentTerm, rf.getLastLog(), args)
 	}
 	DPrintf("%d (votefor %d) timeDurant %d electTimeout %d\n", rf.me, rf.votedFor, rf.timeDuration, rf.electTimeout)
 }
@@ -336,10 +366,10 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 
 func (rf *Raft) updateCommit() {
 	lastIndex := rf.getLastLog().Index
-	index := rf.commitIndex + 1
+
 	newCommitIndex := rf.commitIndex
 
-	for ; index <= lastIndex; index ++ {
+	for index := rf.commitIndex + 1; index <= lastIndex; index ++ {
 		calcNum := 1
 		for j := range(rf.peers) {
 			if j != rf.me && rf.matchIndex[j] >= index && rf.log[index].Term == rf.currentTerm{
@@ -353,9 +383,9 @@ func (rf *Raft) updateCommit() {
 		}
 	}
 
-	if newCommitIndex != rf.commitIndex {
+	if newCommitIndex > rf.commitIndex {
 		rf.commitIndex = newCommitIndex
-		Printf_2B("[commit] %d commitIndex %d log %+v\n", rf.me, rf.commitIndex, rf.log[rf.commitIndex])
+		Printf_2B("[commit] %d commitIndex %d log %+v\n", rf.me, rf.commitIndex, rf.log)
 		rf.commitChannel <- true
 	}
 }
@@ -366,20 +396,14 @@ func (rf *Raft) broadcaseRequestAppendEntries() {
 
 	baseIndex := rf.log[0].Index
 
-	//Printf_2B("[broadcaseRequestAppendEntries] matchIndex %+v", rf.matchIndex)
-	//Printf_2B("[broadcaseRequestAppendEntries] nextIndex %+v", rf.nextIndex)
-	//Printf_2B("[broadcaseRequestAppendEntries] commitIndex %+v", rf.commitIndex)
 	rf.updateCommit()
 	//var w sync.WaitGroup
 	for i := range rf.peers {
 		if i == rf.me {
 			continue
 		}
-
 		prevIndex := rf.getPrevIndex(i)
 		prevTerm := rf.getPrevTerm(i)
-
-
 
 		args := &RequestAppendEntriesArgs{
 			Term:rf.currentTerm,
@@ -391,16 +415,13 @@ func (rf *Raft) broadcaseRequestAppendEntries() {
 		args.Entries = make([]Msg, len(rf.log[prevIndex + 1 - baseIndex:]))
 		copy(args.Entries, rf.log[prevIndex + 1 - baseIndex:])
 
-		if rf.timeDuration < 20 && len(args.Entries) > 0 {
-			//Printf_2B("[broadcaseRequestAppendEntries] %d to %d args %+v\n", rf.me, i, args)
-			rf.timeDuration += 1
-		}
-
 		reply := &RequestAppendEntriesReply{}
 
 		go func(i int) {
 			ok := rf.sendRequestAppendEntries(i, args, reply)
 			//Printf_2B("[broadcaseRequestAppendEntries]%d get reply %+v from %d \n", rf.me, reply, i)
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
 			if ok {
 				if reply.Term > rf.currentTerm {
 					rf.currentTerm = reply.Term
@@ -415,9 +436,7 @@ func (rf *Raft) broadcaseRequestAppendEntries() {
 						rf.matchIndex[i] = rf.nextIndex[i] - 1
 					}
 				} else {
-					if len(args.Entries) > 0{
-						rf.nextIndex[i] = args.Entries[0].Index - 1
-					}
+					rf.nextIndex[i] = reply.NextIndex
 				}
 			}
 		}(i)
@@ -459,11 +478,15 @@ func (rf *Raft) startElection() {
 	rf.timeDuration = 0
 	rf.currentTerm += 1
 	rf.votedFor = rf.me
-	args := &RequestVoteArgs{Term: rf.currentTerm, CandidateId: rf.me}
-	CPrintf("[startElection] %d term %d\n", rf.me, rf.currentTerm)
+	args := &RequestVoteArgs{
+		Term: rf.currentTerm,
+		CandidateId: rf.me,
+		LastLogIndex:rf.getLastLog().Index,
+		LastLogTerm:rf.getLastLog().Term,
+	}
+	Printf_2B("[startElection] %d term %d\n", rf.me, rf.currentTerm)
 	rf.mu.Unlock()
 
-	replyList := [] *RequestVoteReply{}
 
 	rf.voteCnt = 0
 	if rf.votedFor == rf.me {
@@ -475,13 +498,11 @@ func (rf *Raft) startElection() {
 			continue
 		}
 		reply := &RequestVoteReply{}
-		replyList = append(replyList, reply)
-
 
 		//w.Add(1)
 		go func(i int) {
 			//defer w.Done()
-			CPrintf("[sentVote] %d to %d\n", rf.me, i)
+			Printf_2B("[sentVote] %d to %d\n", rf.me, i)
 			ok := rf.sendRequestVote(i, args, reply)
 			if ok {
 				rf.mu.Lock()
@@ -490,6 +511,7 @@ func (rf *Raft) startElection() {
 				if (reply.Term > rf.currentTerm) {
 					rf.currentTerm = reply.Term
 					rf.becomeFollower()
+					return
 				}
 				if (reply.VoteGranted) {
 					rf.voteCnt ++
@@ -529,23 +551,19 @@ func (rf *Raft) logExist(index int) bool {
 }
 
 func (rf *Raft) getLastLog() Msg {
-	length := len(rf.log)
-	if length <= 0 {
-		return Msg{Index:0, Term:0}
-	} else {
-		return rf.log[length-1]
-	}
+	return rf.log[len(rf.log)-1]
 }
 
 func (rf *Raft) getPrevIndex(peerId int) int {
-	index := rf.nextIndex[peerId]
-	//Printf_2B("[getPrevIndex] peerId %d index %d log %+v\n", peerId, index, rf.log)
-	return rf.log[index - 1].Index
+	return rf.nextIndex[peerId] - 1
 }
 
 func (rf *Raft) getPrevTerm(peerId int) int {
-	index := rf.nextIndex[peerId]
-	return rf.log[index - 1].Term
+	if rf.nextIndex[peerId] - rf.log[0].Index - 1 < 0{
+		Printf_2B("peerId %d nextIndex %d\n", peerId, rf.nextIndex[peerId])
+	}
+	index := rf.nextIndex[peerId] - rf.log[0].Index - 1
+	return rf.log[index].Term
 }
 
 
@@ -651,7 +669,7 @@ func (rf *Raft) commitProcess() {
 // init as different role
 func (rf *Raft) becomeCandidate() {
 	rf.status = CANDIDATE
-	CPrintf("%d become candidate with term %d\n", rf.me, rf.currentTerm)
+	Printf_2B("%d become candidate with term %d\n", rf.me, rf.currentTerm)
 }
 
 func (rf *Raft) becomeFollower() {
@@ -693,6 +711,8 @@ func (rf *Raft) becomeLeader() {
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	//Printf_2B("[Start] id %d command %+v start\n", rf.me, command)
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	index := rf.getLastLog().Index + 1
 	term := rf.currentTerm
 	isLeader := rf.status == LEADER
