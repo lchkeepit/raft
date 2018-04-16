@@ -262,6 +262,7 @@ func (rf *Raft) RequestAppendEntries(args *RequestAppendEntriesArgs, reply *Requ
 			rf.log = append(rf.log, args.Entries[i])
 		}
 		reply.NextIndex = rf.getLastLog().Index + 1
+		Printf_2B("[RequestAppendEntries] %d append log %+v\n", rf.me, rf.log)
 	}
 
 	if reply.Success {
@@ -271,7 +272,7 @@ func (rf *Raft) RequestAppendEntries(args *RequestAppendEntriesArgs, reply *Requ
 			Printf_2B("[commit_follower] %d term %d commitIndex %d log %+v\n", rf.me, rf.currentTerm, rf.commitIndex, rf.log)
 			Printf_2B("[commit_follower] args %+v\n", args)
 		}
-		rf.votedFor = -1
+		rf.votedFor = args.LeaderId
 		rf.becomeFollower()
 	} else {
 		Printf_2B("[RequestAppendEntries] %d term %d reject args %+v\n", rf.me, rf.currentTerm, args)
@@ -357,6 +358,35 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 //
 func (rf *Raft) sendRequestAppendEntries(server int, args *RequestAppendEntriesArgs, reply *RequestAppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestAppendEntries", args, reply)
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if ok {
+		if rf.status != LEADER {
+			return ok
+		}
+		if args.Term != rf.currentTerm {
+			return ok
+		}
+
+		if reply.Term > rf.currentTerm {
+			rf.currentTerm = reply.Term
+			rf.votedFor = -1
+			rf.becomeFollower()
+			return ok
+		}
+
+		if reply.Success {
+			if len(args.Entries) > 0 {
+				rf.nextIndex[server] = args.Entries[len(args.Entries)-1].Index + 1
+				rf.matchIndex[server] = rf.nextIndex[server] - 1
+			} else {
+				rf.nextIndex[server] = reply.NextIndex
+				rf.matchIndex[server] = rf.nextIndex[server] - 1
+			}
+		} else {
+			rf.nextIndex[server] = reply.NextIndex
+		}
+	}
 	return ok
 }
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
@@ -376,10 +406,8 @@ func (rf *Raft) updateCommit() {
 				calcNum += 1
 			}
 		}
-		if calcNum > len(rf.peers) / 2 {
+		if 2 * calcNum > len(rf.peers) {
 			newCommitIndex = index
-		} else {
-			break
 		}
 	}
 
@@ -393,15 +421,16 @@ func (rf *Raft) updateCommit() {
 func (rf *Raft) broadcaseRequestAppendEntries() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-
+	Printf_2B("[broadcaseRequestAppendEntries]%d start\n", rf.me)
 	baseIndex := rf.log[0].Index
 
 	rf.updateCommit()
 	//var w sync.WaitGroup
 	for i := range rf.peers {
-		if i == rf.me {
+		if i == rf.me || rf.status != LEADER {
 			continue
 		}
+
 		prevIndex := rf.getPrevIndex(i)
 		prevTerm := rf.getPrevTerm(i)
 
@@ -418,66 +447,19 @@ func (rf *Raft) broadcaseRequestAppendEntries() {
 		reply := &RequestAppendEntriesReply{}
 
 		go func(i int) {
-			ok := rf.sendRequestAppendEntries(i, args, reply)
-			//Printf_2B("[broadcaseRequestAppendEntries]%d get reply %+v from %d \n", rf.me, reply, i)
-			rf.mu.Lock()
-			defer rf.mu.Unlock()
-			if ok {
-				if reply.Term > rf.currentTerm {
-					rf.currentTerm = reply.Term
-					rf.votedFor = -1
-					rf.becomeFollower()
-					return
-				}
-
-				if reply.Success {
-					if len(args.Entries) > 0{
-						rf.nextIndex[i] = args.Entries[len(args.Entries) - 1].Index + 1
-						rf.matchIndex[i] = rf.nextIndex[i] - 1
-					}
-				} else {
-					rf.nextIndex[i] = reply.NextIndex
-				}
-			}
+			//Printf_2B("[broadcaseRequestAppendEntries]%d send to %d arg %+v\n", rf.me, i, args)
+			rf.sendRequestAppendEntries(i, args, reply)
+			//Printf_2B("[broadcaseRequestAppendEntries2]%d send to %d arg %+v\n", rf.me, i, args)
+			//Printf_2B("[broadcaseRequestAppendEntries]%d term %d status %+v get reply %+v from %d \n", rf.me, rf.currentTerm, rf.status, reply, i)
 		}(i)
 	}
-}
-
-func (rf *Raft) heartBeat() {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	//CPrintf("[heartbeatRequest] from %d\n", rf.me)
-	args := &RequestAppendEntriesArgs{Term:rf.currentTerm, LeaderId:rf.me}
-
-	//var w sync.WaitGroup
-	for i := range rf.peers {
-		if i == rf.me {
-			continue
-		}
-		reply := &RequestAppendEntriesReply{}
-
-		go func(i int) {
-			//defer w.Done()[
-			//CPrintf("%d Send heartbeatRequest to %d\n", rf.me, i)
-			ok := rf.sendRequestAppendEntries(i, args, reply)
-			if ok {
-				if reply.Term > rf.currentTerm {
-					rf.currentTerm = reply.Term
-					rf.votedFor = -1
-					rf.becomeFollower()
-				}
-			}
-
-		}(i)
-	}
-	//w.Wait()
 }
 
 func (rf *Raft) startElection() {
 	rf.mu.Lock()
-	rf.timeDuration = 0
 	rf.currentTerm += 1
 	rf.votedFor = rf.me
+	rf.voteCnt = 1
 	args := &RequestVoteArgs{
 		Term: rf.currentTerm,
 		CandidateId: rf.me,
@@ -487,11 +469,6 @@ func (rf *Raft) startElection() {
 	Printf_2B("[startElection] %d term %d\n", rf.me, rf.currentTerm)
 	rf.mu.Unlock()
 
-
-	rf.voteCnt = 0
-	if rf.votedFor == rf.me {
-		rf.voteCnt = 1
-	}
 	//var w sync.WaitGroup
 	for i := range rf.peers {
 		if i == rf.me || rf.status == FOLLOWER{
@@ -559,56 +536,9 @@ func (rf *Raft) getPrevIndex(peerId int) int {
 }
 
 func (rf *Raft) getPrevTerm(peerId int) int {
-	if rf.nextIndex[peerId] - rf.log[0].Index - 1 < 0{
-		Printf_2B("peerId %d nextIndex %d\n", peerId, rf.nextIndex[peerId])
-	}
 	index := rf.nextIndex[peerId] - rf.log[0].Index - 1
 	return rf.log[index].Term
 }
-
-
-// handle as different role
-func (rf *Raft) handleCandidate() {
-	if rf.timeDuration >= rf.electTimeout {
-		rf.startElection()
-	}
-}
-func (rf *Raft) handleFollower() {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	if rf.timeDuration >= rf.electTimeout{
-		CPrintf("[debug] %d timeDurant %d electTimeout %d \n", rf.me, rf.timeDuration, rf.electTimeout)
-		rf.becomeCandidate()
-	}
-}
-func (rf *Raft) handleLeader() {
-	if rf.timeDuration >= HEART_BEAT_TIMEDURATION {
-		rf.heartBeat()
-		//rf.broadcaseRequestAppendEntries()
-		rf.timeDuration = 0
-	}
-}
-
-func (rf *Raft) raftProcess() {
-	CPrintf("%d raftProcess Start", rf.me)
-	for true {
-		switch rf.status{
-			case FOLLOWER:
-				rf.handleFollower()
-				break
-			case CANDIDATE:
-				rf.handleCandidate()
-				break
-			case LEADER:
-				rf.handleLeader()
-				break
-		}
-		time.Sleep(time.Millisecond)
-		rf.timeDuration += 1;
-	}
-}
-
-
 
 func (rf *Raft) handleFollowerV2() {
 	//CPrintf("%d handle follower\n", rf.me)
@@ -632,7 +562,7 @@ func (rf *Raft) handleCandidateV2() {
 }
 func (rf *Raft) handleLeaderV2() {
 	rf.broadcaseRequestAppendEntries()
-	time.Sleep(time.Duration(HEART_BEAT_TIMEDURATION))
+	time.Sleep(time.Duration(HEART_BEAT_TIMEDURATION) * time.Millisecond)
 }
 
 func (rf *Raft) raftProcessV2() {
@@ -710,18 +640,18 @@ func (rf *Raft) becomeLeader() {
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	//Printf_2B("[Start] id %d command %+v start\n", rf.me, command)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	index := rf.getLastLog().Index + 1
+	index := -1
 	term := rf.currentTerm
 	isLeader := rf.status == LEADER
 
 	// Your code here (2B).
 	if isLeader {
+		Printf_2B("[Start] id %d command %+v log %+v\n", rf.me, command, rf.log)
+		index = rf.getLastLog().Index + 1
 		rf.log = append(rf.log, Msg{Term:term, Index:index, Command:command})
 	}
-	//Printf_2B("[Start] isLeader %+v id %d command %+v end\n", isLeader, rf.me, command)
 	return index, term, isLeader
 }
 
